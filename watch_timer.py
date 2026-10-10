@@ -15,6 +15,15 @@ from scipy.signal import butter, sosfilt
 class WatchTicker:
     """Records audio from the microphone and detects watch ticks."""
 
+    LIFT_ANGLES = (
+        40, 42, 45, 48, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 62, 63, 65, 66, 70,
+    )
+    LIFT_CAPTURE_SECONDS = 0.050
+    LIFT_PRETRIGGER_SECONDS = 0.012
+    EVENT_BIN = 8
+    TICK_RMS_WINDOW_SECONDS = 0.005
+    MIN_TICK_SEPARATION_SECONDS = 0.050
+
     # Waveform-fold rate estimate: the high-passed energy envelope is stored in
     # BIN-sample bins and folded at candidate periods; the sharpest fold wins.
     BIN = 32
@@ -26,10 +35,13 @@ class WatchTicker:
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.threshold = 0.024
+        self.lift_angle = 52
+        self.reference_amplitude = None
         self.audio = None
         self.stream = None
         self.running = False
         self.counting = False
+        self.counting_generation = 0
         self.origin = 0.0
         self.t_now = 0.0
         self.thread = None
@@ -40,8 +52,22 @@ class WatchTicker:
         self.cal_samples = 0
         self.cal_next = 0.0
         self.listen = False
+        self.synthetic = False
+        self.hp_ratio = 1.0
         self.volume = 1.0
         self.out_stream = None
+        self._synth_tail = np.zeros(int(0.05 * sample_rate), dtype=np.float32)
+        click_t = np.arange(int(0.04 * sample_rate)) / sample_rate
+        attack = np.minimum(click_t / 0.0012, 1.0)
+        # Wood-block style ticks kept below the 6 kHz detection high-pass so any
+        # speaker-to-microphone leakage is invisible to the tick detector.
+        lowpass = butter(4, 3500, "lp", fs=sample_rate, output="sos")
+        self._synth_clicks = []
+        for freq, decay in ((1900, 0.007), (1400, 0.009)):
+            click = attack * np.sin(2 * np.pi * freq * click_t) * np.exp(-click_t / decay)
+            click = sosfilt(lowpass, click)
+            self._synth_clicks.append((click / np.abs(click).max()).astype(np.float32))
+        self._synth_count = 0
         self.play_queue = queue.Queue(maxsize=8)
         self.play_thread = None
         self.hp_sos = butter(4, 6000, "hp", fs=sample_rate, output="sos")
@@ -53,10 +79,64 @@ class WatchTicker:
     def reset(self):
         self.tick_times = []
         self.ticks = []
+        self.event_spacings = []
         self.env_bins = []
         self.fold_result = None
 
+    def _measure_event_spacing(self, envelope):
+        """Estimate the separation of two distinct acoustic events in a tick."""
+        values = np.asarray(envelope, dtype=np.float64)
+        if not len(values):
+            return None
+        peak = float(values.max())
+        noise = float(np.median(values))
+        if peak <= 6 * noise:
+            return None
+        active = values >= max(0.15 * peak, 6 * noise)
+        edges = np.diff(np.pad(active.astype(np.int8), (1, 1)))
+        starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        if not len(starts):
+            return None
+        clusters = []
+        start, end = int(starts[0]), int(ends[0])
+        for next_start, next_end in zip(starts[1:], ends[1:]):
+            if next_start - end <= 3:
+                end = int(next_end)
+            else:
+                cluster = values[start:end]
+                peak_index = start + int(np.argmax(cluster))
+                clusters.append((peak_index, float(values[peak_index])))
+                start, end = int(next_start), int(next_end)
+        cluster = values[start:end]
+        peak_index = start + int(np.argmax(cluster))
+        clusters.append((peak_index, float(values[peak_index])))
+        prominent = [
+            (index, strength) for index, strength in clusters
+            if strength >= max(0.3 * peak, 8 * noise)
+        ]
+        pairs = [
+            (first, second) for i, first in enumerate(prominent)
+            for second in prominent[i + 1:]
+            if 0.0015 <= (second[0] - first[0]) * self.EVENT_BIN / self.sample_rate <= 0.030
+        ]
+        if not pairs:
+            return None
+        first, second = max(pairs, key=lambda pair: pair[0][1] * pair[1][1])
+        return (second[0] - first[0]) * self.EVENT_BIN / self.sample_rate
+
+    @staticmethod
+    def amplitude_from_lift_time(lift_angle, lift_time, beat_period):
+        """Return timegrapher amplitude in degrees for a measured lift time."""
+        if not lift_time or not beat_period or not 0 < lift_time < beat_period:
+            return None
+        denominator = np.sin(np.pi * lift_time / beat_period)
+        if denominator <= 0:
+            return None
+        amplitude = lift_angle / denominator
+        return float(amplitude) if np.isfinite(amplitude) and amplitude <= 360 else None
+
     def begin_counting(self):
+        self.counting_generation += 1
         self.reset()
         self.origin = self.t_now
         self.counting = True
@@ -153,8 +233,8 @@ class WatchTicker:
         self.play_thread = threading.Thread(target=self._play_loop, daemon=True)
         self.play_thread.start()
 
-    def set_listen(self, enabled):
-        if enabled and self.out_stream is None and self.audio:
+    def _ensure_output(self):
+        if self.out_stream is None and self.audio:
             self.out_stream = self.audio.open(
                 format=pyaudio.paFloat32,
                 channels=1,
@@ -162,7 +242,36 @@ class WatchTicker:
                 output=True,
                 frames_per_buffer=self.chunk_size,
             )
+
+    # Listen and synthetic ticks share one output stream, so only one can be on.
+    def set_listen(self, enabled):
+        if enabled:
+            self._ensure_output()
+            self.synthetic = False
         self.listen = enabled
+
+    def set_synthetic(self, enabled):
+        if enabled:
+            self._ensure_output()
+            self.listen = False
+            self._synth_tail[:] = 0.0
+            self._synth_count = 0
+        self.synthetic = enabled
+
+    def _synth_chunk(self, tick_positions, rms_values):
+        """Render one output chunk: an alternating tick/tock per detected tick, scaled by its level."""
+        pad = len(self._synth_tail)
+        buffer = np.zeros(self.chunk_size + pad, dtype=np.float32)
+        buffer[:pad] += self._synth_tail
+        for offset, _tick_sample in tick_positions:
+            level = float(rms_values[offset])
+            gain = min(1.0, 0.5 * self.volume * level / max(self.threshold * 4, 1e-6))
+            click = self._synth_clicks[self._synth_count % 2]
+            self._synth_count += 1
+            end = min(offset + len(click), len(buffer))
+            buffer[offset:end] += gain * click[:end - offset]
+        self._synth_tail = buffer[self.chunk_size:].copy()
+        return np.clip(buffer[:self.chunk_size], -1.0, 1.0)
 
     def _play_loop(self):
         # Playback runs on its own thread so a slow speaker never stalls tick detection.
@@ -172,7 +281,7 @@ class WatchTicker:
             except queue.Empty:
                 continue
             stream = self.out_stream
-            if stream is not None and self.listen:
+            if stream is not None and (self.listen or self.synthetic):
                 try:
                     stream.write(data)
                 except Exception:
@@ -182,6 +291,7 @@ class WatchTicker:
         self.running = False
         self.counting = False
         self.listen = False
+        self.synthetic = False
         for t in (self.thread, self.play_thread):
             if t:
                 t.join(timeout=2)
@@ -201,6 +311,19 @@ class WatchTicker:
     def _loop(self):
         chunk_index = 0
         above = False
+        last_tick_sample = -int(self.MIN_TICK_SEPARATION_SECONDS * self.sample_rate)
+        rms_window = max(1, int(round(self.TICK_RMS_WINDOW_SECONDS * self.sample_rate)))
+        rms_history = np.zeros(rms_window - 1, dtype=np.float64)
+        hp_history = np.zeros(rms_window - 1, dtype=np.float64)
+        click_capture = None
+        capture_generation = self.counting_generation
+        capture_bins = int(np.ceil(
+            self.LIFT_CAPTURE_SECONDS * self.sample_rate / self.EVENT_BIN
+        ))
+        pretrigger_bins = int(np.ceil(
+            self.LIFT_PRETRIGGER_SECONDS * self.sample_rate / self.EVENT_BIN
+        ))
+        envelope_history = deque(maxlen=pretrigger_bins)
         while self.running:
             try:
                 data = self.stream.read(self.chunk_size, exception_on_overflow=False)
@@ -212,37 +335,107 @@ class WatchTicker:
             samples = np.frombuffer(data, dtype=np.float32)
             # The filter state must see every chunk, even when not counting.
             filtered, self.hp_zi = sosfilt(self.hp_sos, samples.astype(np.float64), zi=self.hp_zi)
+            bins = filtered.reshape(-1, self.BIN)
+            envelope = np.sqrt((bins ** 2).mean(1)).astype(np.float32)
+            event_bins = filtered.reshape(-1, self.EVENT_BIN)
+            event_envelope = np.sqrt((event_bins ** 2).mean(1)).astype(np.float32)
+            if capture_generation != self.counting_generation:
+                click_capture = None
+                capture_generation = self.counting_generation
             if self.counting:
-                bins = filtered.reshape(-1, self.BIN)
-                self.env_bins.append(np.sqrt((bins ** 2).mean(1)).astype(np.float32))
+                self.env_bins.append(envelope)
             if self.listen:
                 out = np.clip(samples * self.volume, -1.0, 1.0).astype(np.float32)
                 try:
                     self.play_queue.put_nowait(out.tobytes())
                 except queue.Full:
                     pass
-            rms = float(np.sqrt(np.mean(samples ** 2)))
-            # Time from the sample count avoids jitter from chunk scheduling.
-            t = chunk_index * self.chunk_size / self.sample_rate
+            # A rolling RMS finds threshold crossings inside each audio block.
+            squared = np.concatenate((rms_history, samples.astype(np.float64) ** 2))
+            cumulative = np.concatenate(([0.0], np.cumsum(squared)))
+            rms_values = np.sqrt(
+                (cumulative[rms_window:] - cumulative[:-rms_window]) / rms_window
+            )
+            rms_history = squared[-(rms_window - 1):] if rms_window > 1 else np.empty(0)
+            hp_squared = np.concatenate((hp_history, filtered ** 2))
+            hp_cumulative = np.concatenate(([0.0], np.cumsum(hp_squared)))
+            hp_rms_values = np.sqrt(
+                (hp_cumulative[rms_window:] - hp_cumulative[:-rms_window]) / rms_window
+            )
+            hp_history = hp_squared[-(rms_window - 1):] if rms_window > 1 else np.empty(0)
+            # Synthetic playback can leak from the speaker into the microphone. Its energy is
+            # low-pitched, so detect on the high-passed signal, rescaled to the raw level.
+            if self.synthetic:
+                rms_values = hp_rms_values * self.hp_ratio
+            rising = (rms_values > self.threshold) & ~np.concatenate(
+                ([above], rms_values[:-1] > self.threshold)
+            )
+            sample_start = chunk_index * self.chunk_size
+            min_separation = self.MIN_TICK_SEPARATION_SECONDS * self.sample_rate
+            if self.synthetic and len(self.live_ticks) >= 6:
+                recent = np.diff(list(self.live_ticks)[-8:])
+                typical = float(np.median(recent[recent > 0.05])) if np.any(recent > 0.05) else 0.0
+                # Playback can leak into the microphone; ignore anything before most of a beat.
+                min_separation = max(min_separation, min(0.9 * typical, 0.6) * self.sample_rate)
+            tick_positions = []
+            for offset in np.flatnonzero(rising):
+                tick_sample = sample_start + int(offset) - rms_window // 2
+                if tick_sample - last_tick_sample < min_separation:
+                    continue
+                tick_positions.append((int(offset), max(0, tick_sample)))
+                last_tick_sample = tick_sample
+                if not self.synthetic:
+                    span = slice(int(offset), int(offset) + 4 * rms_window)
+                    raw_peak = float(rms_values[span].max())
+                    hp_peak = float(hp_rms_values[span].max())
+                    if hp_peak > 1e-9:
+                        self.hp_ratio += 0.2 * (min(raw_peak / hp_peak, 50.0) - self.hp_ratio)
+            above = bool(rms_values[-1] > self.threshold)
+            if self.synthetic:
+                try:
+                    self.play_queue.put_nowait(
+                        self._synth_chunk(tick_positions, rms_values).tobytes()
+                    )
+                except queue.Full:
+                    pass
             chunk_index += 1
+            sample_count = chunk_index * self.chunk_size
+            # Report elapsed time and clock calibration from the actual audio sample count.
+            t = sample_count / self.sample_rate
             self.t_now = t
-            self._log_clock(chunk_index)
-            tick = rms > self.threshold and not above
-            above = rms > self.threshold
-            if tick:
-                self.live_ticks.append(t)
+            self._log_clock(sample_count)
+            for offset, tick_sample in tick_positions:
+                tick_time = tick_sample / self.sample_rate
+                tick_level = float(rms_values[offset])
+                self.live_ticks.append(tick_time)
                 if self.counting:
-                    self.tick_times.append(t - self.origin)
-                    self.ticks.append(rms)
-            self.events.put(("level", t, rms))
+                    self.tick_times.append(tick_time - self.origin)
+                    self.ticks.append(tick_level)
+                    self.event_spacings.append(None)
+                    click_capture = list(envelope_history)
+                    capture_generation = self.counting_generation
+                    event_offset = offset // self.EVENT_BIN
+                    click_capture.extend(event_envelope[event_offset:])
+                    if len(click_capture) >= capture_bins:
+                        self.event_spacings[-1] = self._measure_event_spacing(click_capture)
+                        click_capture = None
+            if not tick_positions and self.counting and click_capture is not None:
+                click_capture.extend(event_envelope)
+                if len(click_capture) >= capture_bins:
+                    self.event_spacings[-1] = self._measure_event_spacing(click_capture)
+                    click_capture = None
+            elif not self.counting:
+                click_capture = None
+            envelope_history.extend(event_envelope)
+            self.events.put(("level", t, float(np.sqrt(np.mean(samples ** 2)))))
 
     CAL_MIN_SECONDS = 120.0
 
-    def _log_clock(self, chunk_index):
+    def _log_clock(self, sample_count):
         # Pair the audio sample count with the system clock (NTP/GPS-disciplined).
         now = time.time()
         if now >= self.cal_next:
-            self.cal_points.append((chunk_index * self.chunk_size, now))
+            self.cal_points.append((sample_count, now))
             self.cal_next = now + 1.0
 
     def clock_report(self):
@@ -310,6 +503,23 @@ class WatchTicker:
             if len(tick_iv) and len(tock_iv) else 0.0
         )
         volumes = np.array(self.ticks)
+        event_spacings = []
+        amplitudes = []
+        for index, event_spacing in enumerate(self.event_spacings):
+            interval_index = index - 1
+            if (
+                event_spacing is None or interval_index < 0 or
+                interval_index >= len(intervals) or not mask[interval_index]
+            ):
+                continue
+            amplitude = self.amplitude_from_lift_time(
+                self.lift_angle, event_spacing * factor, mean,
+            )
+            if amplitude is not None:
+                event_spacings.append(event_spacing * factor)
+                amplitudes.append(amplitude)
+        event_spacing = float(np.median(event_spacings)) if event_spacings else None
+        amplitude = float(np.median(amplitudes)) if amplitudes else None
         return {
             "bph": bph,
             "rate_basis": rate_basis,
@@ -323,19 +533,45 @@ class WatchTicker:
             "outliers": int(len(intervals) - len(good)),
             "volume_mean": float(volumes.mean()),
             "volume_peak": float(volumes.max()),
+            "event_spacing": event_spacing,
+            "amplitude": amplitude,
+            "amplitude_samples": len(amplitudes),
             "intervals": intervals,
         }
 
     def save_data(self, filename):
+        stats = self.stats()
+        beat_period = stats["mean"] / 1000.0 if stats else None
         with open(filename, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["Tick", "Time_s", "Interval_s", "Volume"])
+            writer.writerow([
+                "Tick", "Time_s", "Interval_s", "Volume", "Lift_angle_deg",
+                "Acoustic_event_spacing_ms", "Estimated_amplitude_deg",
+                "Reference_amplitude_deg", "Amplitude_error_deg",
+            ])
+            reference = self.reference_amplitude
+            run_amplitude = stats["amplitude"] if stats else None
+            error = (
+                f"{run_amplitude - reference:.1f}"
+                if reference is not None and run_amplitude is not None else ""
+            )
             previous = None
             factor = self.clock_factor()
             for i, (t, volume) in enumerate(zip(self.tick_times, self.ticks), 1):
                 t *= factor
                 interval = "" if previous is None else f"{t - previous:.6f}"
-                writer.writerow([i, f"{t:.6f}", interval, f"{volume:.6f}"])
+                event_spacing = self.event_spacings[i - 1]
+                event_spacing_s = event_spacing * factor if event_spacing is not None else None
+                amplitude = self.amplitude_from_lift_time(
+                    self.lift_angle, event_spacing_s, beat_period,
+                ) if event_spacing_s and beat_period else None
+                writer.writerow([
+                    i, f"{t:.6f}", interval, f"{volume:.6f}", self.lift_angle,
+                    f"{event_spacing_s * 1000:.2f}" if event_spacing_s else "",
+                    f"{amplitude:.1f}" if amplitude is not None else "",
+                    f"{reference:.1f}" if reference is not None else "",
+                    error,
+                ])
                 previous = t
 
 
@@ -377,6 +613,7 @@ class WatchTimerApp(tk.Tk):
         self.ticker.stop()
         self.history.clear()
         self.listen_var.set(False)
+        self.synth_var.set(False)
         self.started_at = None
         try:
             self.ticker.start(index)
@@ -436,6 +673,23 @@ class WatchTimerApp(tk.Tk):
         ttk.Button(thr_row, text="+", width=2,
                    command=lambda: self._nudge_threshold(0.001)).pack(side="left")
 
+        ttk.Label(frame, text="Movement lift angle (degrees)").pack(anchor="w")
+        self.lift_angle_var = tk.StringVar(value=str(self.ticker.lift_angle))
+        self.lift_angle_combo = ttk.Combobox(
+            frame, state="readonly", width=8,
+            values=[str(angle) for angle in self.ticker.LIFT_ANGLES],
+            textvariable=self.lift_angle_var,
+        )
+        self.lift_angle_combo.pack(anchor="w", pady=(0, 8))
+        self.lift_angle_combo.bind("<<ComboboxSelected>>", self._on_lift_angle)
+
+        ttk.Label(frame, text="Reference amplitude (°, optional)").pack(anchor="w")
+        self.reference_var = tk.StringVar()
+        reference_entry = ttk.Entry(frame, width=8, textvariable=self.reference_var)
+        reference_entry.pack(anchor="w", pady=(0, 8))
+        reference_entry.bind("<KeyRelease>", self._on_reference)
+        reference_entry.bind("<FocusOut>", self._on_reference)
+
         self.listen_var = tk.BooleanVar(value=False)
         listen_row = ttk.Frame(frame)
         listen_row.pack(fill="x", pady=(0, 8))
@@ -448,6 +702,11 @@ class WatchTimerApp(tk.Tk):
             listen_row, from_=0.0, to=5.0, variable=self.volume_var,
             command=self._on_volume,
         ).pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.synth_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame, text="Synthetic ticks from readings (use headphones)",
+            variable=self.synth_var, command=self._on_synthetic,
+        ).pack(anchor="w", pady=(0, 8))
         ttk.Label(frame, text="Live waveform (last 4 s)  |  red = detected ticks").pack(anchor="w")
         self.graph = tk.Canvas(
             frame, width=self.GRAPH_W, height=self.GRAPH_H,
@@ -480,13 +739,22 @@ class WatchTimerApp(tk.Tk):
         for row, name in enumerate([
             "Beat rate", "Nearest standard", "Rate error", "Rate basis", "Beat error",
             "Interval mean", "Interval min / max", "Interval jitter",
-            "Outliers dropped", "Tick volume (mean / peak)", "Quality",
+            "Outliers dropped", "Tick volume (mean / peak)", "Acoustic event spacing",
+            "Amplitude (estimated)", "App timing status",
         ]):
             ttk.Label(mgrid, text=name + ":").grid(row=row, column=0, sticky="w", pady=2)
             label = ttk.Label(mgrid, text="-", font=("Helvetica", 12, "bold"))
             label.grid(row=row, column=1, sticky="w", padx=10)
             self.metrics[name] = label
 
+        ttk.Label(
+            side,
+            text=(
+                "The event spacing is only a proxy for escapement lift time; it may not mark "
+                "the true lift endpoints. Microphone-only amplitude is uncalibrated."
+            ),
+            wraplength=400,
+        ).pack(anchor="w", pady=(2, 0))
         ttk.Label(side, text="Tick intervals (ms) per tick  |  yellow = mean").pack(anchor="w", pady=(12, 0))
         self.interval_graph = tk.Canvas(
             side, width=self.IV_W, height=self.IV_H,
@@ -504,9 +772,32 @@ class WatchTimerApp(tk.Tk):
     def _on_listen(self):
         try:
             self.ticker.set_listen(self.listen_var.get())
+            if self.listen_var.get():
+                self.synth_var.set(False)
         except Exception as exc:
             self.listen_var.set(False)
             messagebox.showerror("Speaker error", str(exc))
+
+    def _on_synthetic(self):
+        try:
+            self.ticker.set_synthetic(self.synth_var.get())
+            if self.synth_var.get():
+                self.listen_var.set(False)
+        except Exception as exc:
+            self.synth_var.set(False)
+            messagebox.showerror("Speaker error", str(exc))
+
+    def _on_lift_angle(self, _event=None):
+        self.ticker.lift_angle = int(self.lift_angle_var.get())
+
+    def _on_reference(self, _event=None):
+        try:
+            value = float(self.reference_var.get())
+        except ValueError:
+            value = None
+        self.ticker.reference_amplitude = (
+            value if value is not None and np.isfinite(value) and value > 0 else None
+        )
 
     def _on_volume(self, _value):
         self.ticker.volume = self.volume_var.get()
@@ -658,17 +949,24 @@ class WatchTimerApp(tk.Tk):
         m["Outliers dropped"].config(text=str(stats["outliers"]))
         m["Tick volume (mean / peak)"].config(
             text=f"{stats['volume_mean']:.3f} / {stats['volume_peak']:.3f}")
-        m["Quality"].config(text=self._quality(stats))
+        amplitude = stats["amplitude"]
+        event_spacing = stats["event_spacing"]
+        m["Acoustic event spacing"].config(
+            text=f"{event_spacing * 1000:.2f} ms ({stats['amplitude_samples']} ticks)"
+            if event_spacing is not None else "No clear pair; move mic closer / reduce noise")
+        m["Amplitude (estimated)"].config(
+            text=f"{amplitude:.0f}°" if amplitude is not None else "Not measured")
+        m["App timing status"].config(text=self._quality(stats))
         self._draw_intervals(stats)
 
     @staticmethod
     def _quality(stats):
         rate, beat, jitter = abs(stats["rate_error"]), stats["beat_error"], stats["jitter"]
         if rate <= 10 and beat <= 1.0 and jitter <= 2.0:
-            return "Excellent"
+            return "Within app targets"
         if rate <= 30 and beat <= 2.5 and jitter <= 5.0:
-            return "Good"
-        return "Needs service / noisy"
+            return "Near app targets"
+        return "Outside app targets"
 
     def _draw_intervals(self, stats):
         g = self.interval_graph
